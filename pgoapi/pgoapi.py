@@ -38,20 +38,20 @@ from pgoapi.utilities import parse_api_endpoint
 from pgoapi.exceptions import AuthException, NotLoggedInException, ServerBusyOrOfflineException, NoPlayerPositionSetException, EmptySubrequestChainException, AuthTokenExpiredException, ServerApiEndpointRedirectException, UnexpectedResponseException
 
 from . import protos
-from POGOProtos.Networking.Requests_pb2 import RequestType
+from POGOProtos.Networking.Requests.RequestType_pb2 import RequestType
 
 logger = logging.getLogger(__name__)
 
 
 class PGoApi:
 
-    def __init__(self, provider=None, oauth2_refresh_token=None, username=None, password=None, position_lat=None, position_lng=None, position_alt=None):
+    def __init__(self, provider=None, oauth2_refresh_token=None, username=None, password=None, position_lat=None, position_lng=None, position_alt=None, proxy_config=None, device_info=None):
         self.set_logger()
         self.log.info('%s v%s - %s', __title__, __version__, __copyright__)
 
         self._auth_provider = None
         if provider is not None and ((username is not None and password is not None) or (oauth2_refresh_token is not None)):
-            self.set_authentication(provider, oauth2_refresh_token, username, password)
+            self.set_authentication(provider, oauth2_refresh_token, username, password, proxy_config)
 
         self.set_api_endpoint("pgorelease.nianticlabs.com/plfe")
 
@@ -61,10 +61,19 @@ class PGoApi:
 
         self._signature_lib = None
 
+        self._session = requests.session()
+        self._session.headers.update({'User-Agent': 'Niantic App'})
+        self._session.verify = True
+
+        if proxy_config is not None:
+            self._session.proxies = proxy_config
+
+        self.device_info = device_info
+
     def set_logger(self, logger=None):
         self.log = logger or logging.getLogger(__name__)
 
-    def set_authentication(self, provider=None, oauth2_refresh_token=None, username=None, password=None):
+    def set_authentication(self, provider=None, oauth2_refresh_token=None, username=None, password=None, proxy_config=None):
         if provider == 'ptc':
             self._auth_provider = AuthPtc()
         elif provider == 'google':
@@ -76,22 +85,29 @@ class PGoApi:
 
         self.log.debug('Auth provider: %s', provider)
 
+        if proxy_config is not None:
+            self._auth_provider.set_proxy(proxy_config)
+
         if oauth2_refresh_token is not None:
             self._auth_provider.set_refresh_token(oauth2_refresh_token)
         elif username is not None and password is not None:
-            self._auth_provider.user_login(username, password)
+            if not self._auth_provider.user_login(username, password):
+                raise AuthException("User login failed!")
         else:
             raise AuthException("Invalid Credential Input - Please provide username/password or an oauth2 refresh token")
 
     def get_position(self):
         return (self._position_lat, self._position_lng, self._position_alt)
 
-    def set_position(self, lat, lng, alt):
+    def set_position(self, lat, lng, alt=None):
         self.log.debug('Set Position - Lat: %s Long: %s Alt: %s', lat, lng, alt)
 
         self._position_lat = lat
         self._position_lng = lng
         self._position_alt = alt
+
+    def set_proxy(self, proxy_config):
+        self._session.proxies = proxy_config
 
     def get_api_endpoint(self):
         return self._api_endpoint
@@ -106,7 +122,8 @@ class PGoApi:
         return self._auth_provider
 
     def create_request(self):
-        request = PGoApiRequest(self, self._position_lat, self._position_lng, self._position_alt)
+        request = PGoApiRequest(self, self._position_lat, self._position_lng,
+                                self._position_alt, self.device_info)
         return request
 
     def activate_signature(self, lib_path):
@@ -149,9 +166,10 @@ class PGoApi:
     """
     def login(self, provider, username, password, lat=None, lng=None, alt=None, app_simulation=True):
 
-        if lat is not None and lng is not None and alt is not None:
+        if lat and lng:
             self._position_lat = lat
             self._position_lng = lng
+        if alt:
             self._position_alt = alt
 
         try:
@@ -177,7 +195,9 @@ class PGoApi:
 
 
 class PGoApiRequest:
-    def __init__(self, parent, position_lat, position_lng, position_alt):
+
+    def __init__(self, parent, position_lat, position_lng, position_alt,
+                 device_info=None):
         self.log = logging.getLogger(__name__)
 
         self.__parent__ = parent
@@ -191,19 +211,21 @@ class PGoApiRequest:
         self._position_alt = position_alt
 
         self._req_method_list = []
+        self.device_info = device_info
 
     def call(self):
         if not self._req_method_list:
             raise EmptySubrequestChainException()
 
-        if (self._position_lat is None) or (self._position_lng is None) or (self._position_alt is None):
+        if (self._position_lat is None) or (self._position_lng is None):
             raise NoPlayerPositionSetException()
 
         if self._auth_provider is None or not self._auth_provider.is_login():
             self.log.info('Not logged in')
-            return NotLoggedInException()
+            raise NotLoggedInException()
 
-        request = RpcApi(self._auth_provider)
+        request = RpcApi(self._auth_provider, self.device_info)
+        request._session = self.__parent__._session
 
         lib_path = self.__parent__.get_signature_lib()
         if lib_path is not None:
@@ -263,7 +285,7 @@ class PGoApiRequest:
     def get_position(self):
         return (self._position_lat, self._position_lng, self._position_alt)
 
-    def set_position(self, lat, lng, alt):
+    def set_position(self, lat, lng, alt=None):
         self.log.debug('Set Position - Lat: %s Long: %s Alt: %s', lat, lng, alt)
 
         self._position_lat = lat
